@@ -14,18 +14,47 @@
 
 
 
+bool TH264Decoder::Iteration()
+{
+	//	pop latest packet
+	auto Packet = mPacketQueue.Pop();
+	if ( !Packet )
+		return true;
+	
+	//	gr: pass pixels and timecode here so allocator can dictate pixel storage?
+	if ( !DecodeNalPacket( GetArrayBridge(*Packet) ) )
+	{
+		std::Debug << "DecodeNalPacket failed... abort?" << std::endl;
+		Soy_AssertTodo();
+		return false;
+	}
+	
+	return true;
+}
 
-TVideo264::TVideo264(std::shared_ptr<TBinaryStream> Stream,std::stringstream& Error) :
-	TVideoDevice		( TVideoDeviceMeta(), Error )
+
+TVideoH264::TVideoH264(std::shared_ptr<TBinaryStream> Stream,std::shared_ptr<TH264Decoder> Decoder,std::stringstream& Error) :
+	TVideoDevice		( TVideoDeviceMeta(), Error ),
+	mDecoder			( Decoder ),
+	mStream				( Stream )
 {
 	//	subscribe to stream's data event
-	if ( !Soy::Assert( Stream != nullptr, "Expected stream" ) )
+	if ( !Soy::Assert( mStream != nullptr, "Expected stream" ) )
+	{
+		Error << __func__ << ": Missing stream";
 		return;
+	}
+	if ( !Soy::Assert( mDecoder != nullptr, "Expected decoder" ) )
+	{
+		Error << __func__ << ": Missing decoder";
+		return;
+	}
 	
-	Stream->mStream.mOnDataPushed.AddListener( *this, &TVideo264::OnData );
+	mStream->mStream.mOnDataPushed.AddListener( *this, &TVideoH264::OnData );
+	mDecoder->mOnDecodedFrame.AddListener( *this, &TVideoH264::OnFrame );
 }
 	
-TVideoDeviceMeta TVideo264::GetMeta() const
+TVideoDeviceMeta TVideoH264::GetMeta() const
 {
 	TVideoDeviceMeta Meta;
 	Meta.mSerial = "DecodedVideo";
@@ -33,12 +62,14 @@ TVideoDeviceMeta TVideo264::GetMeta() const
 	return Meta;
 }
 
-void TVideo264::OnData(bool& Dummy)
+void TVideoH264::OnData(bool& Dummy)
 {
-	
+	while ( PopNextNal() )
+	{
+	}
 }
 
-bool TVideo264::PopNextNal()
+bool TVideoH264::PopNextNal()
 {
 	BufferArray<char,4> NalMarker;
 	NalMarker.PushBack(0);
@@ -46,30 +77,141 @@ bool TVideo264::PopNextNal()
 	NalMarker.PushBack(0);
 	NalMarker.PushBack(1);
 
-	Array<char> NalPacket;
+	//	make a pool for these packet buffers
+	std::shared_ptr<Array<char>> NalPacket( new Array<char>() );
 	bool KeepMarker = false;
-	if ( !mStream->mStream.Pop( GetArrayBridge(NalMarker), GetArrayBridge(NalPacket), KeepMarker ) )
+	if ( !mStream->mStream.Pop( GetArrayBridge(NalMarker), GetArrayBridge(*NalPacket), KeepMarker ) )
 		return false;
-	
-	if ( !DecodeNal( GetArrayBridge(NalPacket) ) )
-		return false;
+
+	//	push onto decoding queue
+	mDecoder->QueueNalPacket( NalPacket );
 	
 	return true;
 }
-	
 
-CoreVideo264::CoreVideo264(std::shared_ptr<TBinaryStream> Stream,std::stringstream& Error) :
-	TVideo264	( Stream, Error )
+// example helper function that wraps a time into a dictionary
+static CFDictionaryRef MakeDictionaryWithDisplayTime(int64_t inFrameDisplayTime)
 {
+	CFStringRef key = CFSTR("MyFrameDisplayTimeKey");
+	CFNumberRef value = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &inFrameDisplayTime);
 	
-}
-	
-bool CoreVideo264::DecodeNal(const ArrayBridge<char>&& NalPacket)
-{
-	std::Debug << __func__ << std::endl;
-	return false;
+	return CFDictionaryCreate(kCFAllocatorDefault,
+							  (const void **)&key,
+							  (const void **)&value,
+							  1,
+							  &kCFTypeDictionaryKeyCallBacks,
+							  &kCFTypeDictionaryValueCallBacks);
 }
 
+bool TH264Decoder_VDA::DecodeNalPacket(const ArrayBridge<char>&& NalPacket)
+{
+	//OSStatus DecodeAFrame(VDADecoder inDecoder, CFDataRef inCompressedFrame, int64_t inFrameDisplayTime)
+	auto& inDecoder = mDecoder;
+	CFDataRef inCompressedFrame;	//	NalPacket
+	int64_t inFrameDisplayTime;		//	display time according to packet
+
+	CFDictionaryRef frameInfo = NULL;
+	
+	// create a dictionary containg some information about the frame being decoded
+	// in this case, we pass in the display time aquired from the stream
+	frameInfo = MakeDictionaryWithDisplayTime(inFrameDisplayTime);
+	
+	// ask the hardware to decode our frame, frameInfo will be retained and pased back to us
+	// in the output callback for this frame
+	auto Result = VDADecoderDecode( inDecoder, 0, inCompressedFrame, frameInfo);
+
+	// the dictionary passed into decode is retained by the framework so
+	// make sure to release it here
+	CFRelease(frameInfo);
+
+	if ( Result != kVDADecoderNoErr )
+	{
+		std::Debug << "VDADecoderDecode failed. err: " << Result << std::endl;
+		return false;
+	}
+	
+	return true;
+}
+
+bool TH264Decoder_VDA::Init(int Width,int Height,SoyPixelsFormat::Type Format,std::stringstream& Error)
+{
+	OSType inSourceFormat = "avc1";
+	//	CFDataRef inAVCCData
+	/*
+	OSStatus CreateDecoder(SInt32 inHeight, SInt32 inWidth,
+						   OSType inSourceFormat, CFDataRef inAVCCData,
+						   VDADecoder *decoderOut)
+	*/
+	OSStatus status;
+	
+	CFMutableDictionaryRef decoderConfiguration = NULL;
+	CFMutableDictionaryRef destinationImageBufferAttributes = NULL;
+	CFDictionaryRef emptyDictionary;
+	
+	CFNumberRef height = NULL;
+	CFNumberRef width= NULL;
+	CFNumberRef sourceFormat = NULL;
+	CFNumberRef pixelFormat = NULL;
+
+	
+	// the avcC data chunk from the bitstream must be present
+	if (inAVCCData == NULL) {
+		fprintf(stderr, "avc1 decoder configuration data cannot be NULL!\n");
+		return paramErr;
+	}
+	
+	// create a CFDictionary describing the source material for decoder configuration
+	decoderConfiguration = CFDictionaryCreateMutable(kCFAllocatorDefault,
+													 4,
+													 &kCFTypeDictionaryKeyCallBacks,
+													 &kCFTypeDictionaryValueCallBacks);
+	
+	height = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &inHeight);
+	width = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &inWidth);
+	sourceFormat = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &inSourceFormat);
+	
+	CFDictionarySetValue(decoderConfiguration, kVDADecoderConfiguration_Height, height);
+	CFDictionarySetValue(decoderConfiguration, kVDADecoderConfiguration_Width, width);
+	CFDictionarySetValue(decoderConfiguration, kVDADecoderConfiguration_SourceFormat, sourceFormat);
+	CFDictionarySetValue(decoderConfiguration, kVDADecoderConfiguration_avcCData, inAVCCData);
+	
+	// create a CFDictionary describing the wanted destination image buffer
+	destinationImageBufferAttributes = CFDictionaryCreateMutable(kCFAllocatorDefault,
+																 2,
+																 &kCFTypeDictionaryKeyCallBacks,
+																 &kCFTypeDictionaryValueCallBacks);
+	
+	OSType cvPixelFormatType = kCVPixelFormatType_422YpCbCr8;
+	pixelFormat = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &cvPixelFormatType);
+	emptyDictionary = CFDictionaryCreate(kCFAllocatorDefault, // our empty IOSurface properties dictionary
+										 NULL,
+										 NULL,
+										 0,
+										 &kCFTypeDictionaryKeyCallBacks,
+										 &kCFTypeDictionaryValueCallBacks);
+	
+	CFDictionarySetValue(destinationImageBufferAttributes, kCVPixelBufferPixelFormatTypeKey, pixelFormat);
+	CFDictionarySetValue(destinationImageBufferAttributes,
+						 kCVPixelBufferIOSurfacePropertiesKey,
+						 emptyDictionary);
+	
+	// create the hardware decoder object
+	status = VDADecoderCreate(decoderConfiguration,
+							  destinationImageBufferAttributes,
+							  (VDADecoderOutputCallback*)myDecoderOutputCallback,
+							  (void *)myUserData,
+							  decoderOut);
+	
+	if (kVDADecoderNoErr != status) {
+		fprintf(stderr, "VDADecoderCreate failed. err: %d\n", status);
+	}
+	
+	if (decoderConfiguration) CFRelease(decoderConfiguration);
+	if (destinationImageBufferAttributes) CFRelease(destinationImageBufferAttributes);
+	if (emptyDictionary) CFRelease(emptyDictionary);
+	
+	return status;
+}
 
 
 TFileStream::TFileStream(const std::string& Filename,std::stringstream& Error) :
